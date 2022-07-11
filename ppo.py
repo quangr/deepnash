@@ -1,3 +1,5 @@
+import copy
+from locale import currency
 from typing import Any, Dict, List, Optional, Type, Union
 
 import numpy as np
@@ -91,6 +93,8 @@ class PPOPolicy(BasePolicy):
         )
         self.actor = actor
         self.optim = optim
+        self.reg_actor = copy.deepcopy(actor)
+        self.reg_actor_old = copy.deepcopy(actor)
         self.dist_fn = dist_fn
         assert 0.0 <= discount_factor <= 1.0, "discount factor should be in [0, 1]"
         self._gamma = discount_factor
@@ -117,6 +121,8 @@ class PPOPolicy(BasePolicy):
         self._norm_adv = advantage_normalization
         self._recompute_adv = recompute_advantage
         self._actor_critic: ActorCritic
+        self._delta_m=3
+        self._eta=0.2
 
     def process_fn(
         self, batch: Batch, buffer: ReplayBuffer, indices: np.ndarray
@@ -126,11 +132,17 @@ class PPOPolicy(BasePolicy):
             self._buffer, self._indices = buffer, indices
         batch = self._compute_returns(batch, buffer, indices)
         batch.act = to_torch_as(batch.act, batch.v_s)
-        old_log_prob = []
+        old_log_prob,reg_log_prob,old_reg_log_prob = [],[],[]
         with torch.no_grad():
             for minibatch in batch.split(self._batch, shuffle=False, merge_last=True):
                 old_log_prob.append(self(minibatch).dist.log_prob(minibatch.act))
+                reg_log_prob.append(self.reg(minibatch).dist.log_prob(minibatch.act))
+                old_reg_log_prob.append(self.reg(minibatch,old=True).dist.log_prob(minibatch.act))
         batch.logp_old = torch.cat(old_log_prob, dim=0)
+        batch.reg_logp = torch.cat(reg_log_prob, dim=0)
+        batch.reg_logp_old = torch.cat(old_reg_log_prob, dim=0)
+        batch = self._transform_returns(batch, buffer, indices)
+        batch = self._compute_values(batch, buffer, indices)
         return batch
 
     def learn(  # type: ignore
@@ -138,41 +150,18 @@ class PPOPolicy(BasePolicy):
     ) -> Dict[str, List[float]]:
         losses, clip_losses, vf_losses, ent_losses = [], [], [], []
         for step in range(repeat):
-            if self._recompute_adv and step > 0:
-                batch = self._compute_returns(batch, self._buffer, self._indices)
+            # if self._recompute_adv and step > 0:
+            #     batch = self._compute_returns(batch, self._buffer, self._indices)
             for minibatch in batch.split(batch_size, merge_last=True):
                 # calculate loss for actor
-                dist = self(minibatch).dist
-                if self._norm_adv:
-                    mean, std = minibatch.adv.mean(), minibatch.adv.std()
-                    minibatch.adv = (minibatch.adv - mean) / std  # per-batch norm
-                ratio = (dist.log_prob(minibatch.act) -
-                         minibatch.logp_old).exp().float()
-                ratio = ratio.reshape(ratio.size(0), -1).transpose(0, 1)
-                surr1 = ratio * minibatch.adv
-                surr2 = ratio.clamp(
-                    1.0 - self._eps_clip, 1.0 + self._eps_clip
-                ) * minibatch.adv
-                if self._dual_clip:
-                    clip1 = torch.min(surr1, surr2)
-                    clip2 = torch.max(clip1, self._dual_clip * minibatch.adv)
-                    clip_loss = -torch.where(minibatch.adv < 0, clip2, clip1).mean()
-                else:
-                    clip_loss = -torch.min(surr1, surr2).mean()
+                Q_s=minibatch.Q_s.clamp(-10000,10000)
+                logits=self(minibatch).logits.gather(-1, minibatch.act.long().unsqueeze(-1))
+                surr = logits * Q_s
+                clip_loss=surr.clamp(-2, 2).mean()
                 # calculate loss for critic
                 value = self.critic(minibatch.obs).flatten()
-                if self._value_clip:
-                    v_clip = minibatch.v_s + \
-                        (value - minibatch.v_s).clamp(-self._eps_clip, self._eps_clip)
-                    vf1 = (minibatch.returns - value).pow(2)
-                    vf2 = (minibatch.returns - v_clip).pow(2)
-                    vf_loss = torch.max(vf1, vf2).mean()
-                else:
-                    vf_loss = (minibatch.returns - value).pow(2).mean()
-                # calculate regularization and overall loss
-                ent_loss = dist.entropy().mean()
-                loss = clip_loss + self._weight_vf * vf_loss \
-                    - self._weight_ent * ent_loss
+                vf_loss = (minibatch.V_s - value).pow(2).mean()
+                loss = clip_loss + self._weight_vf * vf_loss 
                 self.optim.zero_grad()
                 loss.backward()
                 if self._grad_norm:  # clip large gradient
@@ -182,7 +171,6 @@ class PPOPolicy(BasePolicy):
                 self.optim.step()
                 clip_losses.append(clip_loss.item())
                 vf_losses.append(vf_loss.item())
-                ent_losses.append(ent_loss.item())
                 losses.append(loss.item())
 
         return {
@@ -198,35 +186,123 @@ class PPOPolicy(BasePolicy):
         with torch.no_grad():
             for minibatch in batch.split(self._batch, shuffle=False, merge_last=True):
                 v_s.append(self.critic(minibatch.obs))
-                v_s_.append(self.critic(minibatch.obs_next))
         batch.v_s = torch.cat(v_s, dim=0).flatten()  # old value
         v_s = batch.v_s.cpu().numpy()
-        v_s_ = torch.cat(v_s_, dim=0).flatten().cpu().numpy()
         # when normalizing values, we do not minus self.ret_rms.mean to be numerically
         # consistent with OPENAI baselines' value normalization pipeline. Emperical
         # study also shows that "minus mean" will harm performances a tiny little bit
         # due to unknown reasons (on Mujoco envs, not confident, though).
-        if self._rew_norm:  # unnormalize v_s & v_s_
-            v_s = v_s * np.sqrt(self.ret_rms.var + self._eps)
-            v_s_ = v_s_ * np.sqrt(self.ret_rms.var + self._eps)
-        unnormalized_returns, advantages = self.compute_episodic_return(
-            batch,
-            buffer,
-            indices,
-            v_s_,
-            v_s,
-            gamma=self._gamma,
-            gae_lambda=self._lambda
-        )
-        if self._rew_norm:
-            batch.returns = unnormalized_returns / \
-                np.sqrt(self.ret_rms.var + self._eps)
-            self.ret_rms.update(unnormalized_returns)
-        else:
-            batch.returns = unnormalized_returns
-        batch.returns = to_torch_as(batch.returns, batch.v_s)
-        batch.adv = to_torch_as(advantages, batch.v_s)
+        # if self._rew_norm:  # unnormalize v_s & v_s_
+        #     v_s = v_s * np.sqrt(self.ret_rms.var + self._eps)
+        #     v_s_ = v_s_ * np.sqrt(self.ret_rms.var + self._eps)
+        # unnormalized_returns, advantages = self.compute_episodic_return(
+        #     batch,
+        #     buffer,
+        #     indices,
+        #     v_s_,
+        #     v_s,
+        #     gamma=self._gamma,
+        #     gae_lambda=self._lambda
+        # )
+        # if self._rew_norm:
+        #     batch.returns = unnormalized_returns / \
+        #         np.sqrt(self.ret_rms.var + self._eps)
+        #     self.ret_rms.update(unnormalized_returns)
+        # else:
+        #     batch.returns = unnormalized_returns
+        # batch.returns = to_torch_as(batch.returns, batch.v_s)
+        # batch.adv = to_torch_as(advantages, batch.v_s)
         return batch
+
+
+    def _transform_returns(
+        self, batch: Batch, buffer: ReplayBuffer, indices: np.ndarray
+    ) -> Batch:
+        reg_reward=(batch.logp_old-batch.reg_logp).cpu().numpy()
+        for i in range(2):
+            batch.rew[:,i] = batch.rew[:,i]+(1-2*(batch.info.current_player==i).astype(int))*self._eta*reg_reward
+        return batch
+
+    def _compute_values(
+        self, batch: Batch, buffer: ReplayBuffer, indices: np.ndarray
+    ) -> Batch:
+        v_s = batch.v_s.cpu().numpy()
+        rew=batch.rew
+        current_player=batch.info.current_player
+        logp=self(batch).dist.log_prob(batch.act)
+        reg_p=torch.exp(batch.reg_logp)
+        reg_p_old=torch.exp(batch.reg_logp_old)
+        p_ratio=torch.exp(logp-batch.logp_old)
+        reg_p_ratio=torch.exp(logp-batch.reg_logp)
+        V_s=np.zeros(batch.v_s.shape)
+        Q_s=np.zeros(batch.v_s.shape+(2,))
+        for player in range(2):
+            for i in range(len(rew) - 1, -1, -1):
+                if batch.done[i]:
+                    v=0
+                    V=0
+                    r=0
+                    ksi=1
+                if current_player[i]!=player:
+                    r=rew[i][player]+p_ratio[i]*r
+                    ksi=ksi*p_ratio[i]
+                else:
+                    rho=min(1,p_ratio[i]*ksi)
+                    c=min(1,p_ratio[i]*ksi)
+                    delta_V=rho*(rew[i][player]+r*p_ratio[i]+V-v_s[i])
+                    for act in range(2):
+                        ratio=reg_p
+                        Q_s[i][act]=v_s[i]-self._eta*reg_p_ratio[i]+int(act==batch.act[i])/torch.exp(batch.logp_old[i])*(rew[i][player]+self._eta*reg_p_ratio[i]+p_ratio[i]*(r+v)-v_s[i])
+                    v=v_s[i]+delta_V+c*(v-V)
+                    V=v_s[i]
+                    r=0
+                    ksi=1
+                    V_s[i]=v
+        batch.V_s = to_torch_as(V_s, batch.v_s)
+        batch.Q_s = to_torch_as(Q_s, batch.v_s)
+        return batch
+
+    def reg(
+        self,
+        batch: Batch,
+        state: Optional[Union[dict, Batch, np.ndarray]] = None,
+        old=False,
+        **kwargs: Any,
+    ) -> Batch:
+        """Compute action over the given batch data.
+
+        :return: A :class:`~tianshou.data.Batch` which has 4 keys:
+
+            * ``act`` the action.
+            * ``logits`` the network's raw output.
+            * ``dist`` the action distribution.
+            * ``state`` the hidden state.
+
+        .. seealso::
+
+            Please refer to :meth:`~tianshou.policy.BasePolicy.forward` for
+            more detailed explanation.
+        """
+        if old:
+            logits, hidden = self.reg_actor_old(batch.obs, state=state)
+        else:
+            logits, hidden = self.reg_actor(batch.obs, state=state)
+        if isinstance(logits, tuple):
+            dist = self.dist_fn(*logits)
+        else:
+            dist = self.dist_fn(logits)
+        if self._deterministic_eval and not self.training:
+            if self.action_type == "discrete":
+                act = logits.argmax(-1)
+            elif self.action_type == "continuous":
+                act = logits[0]
+        else:
+            act = dist.sample()
+        return Batch(logits=logits, act=act, state=hidden, dist=dist)
+
+
+
+
     def forward(
         self,
         batch: Batch,

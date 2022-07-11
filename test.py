@@ -5,8 +5,6 @@ import pprint
 import gym
 import numpy as np
 import torch
-from torch.utils.tensorboard import SummaryWriter
-
 from tianshou.data import Collector, VectorReplayBuffer
 from tianshou.env import DummyVectorEnv
 from tianshou.trainer import onpolicy_trainer
@@ -64,17 +62,9 @@ class ObservationWrapper(gym.ObservationWrapper):
         obs=obs[self.env.env.current_player][:-2]
         return obs
 
-class RewardWrapper(gym.RewardWrapper):
-    def __init__(self, env):
-        super().__init__(env)
-    
-    def reward(self, rew):
-        # modify rew
-        return rew[self.env.env.current_player]
-
 
 def get_env():
-    return RewardWrapper(ObservationWrapper(gym.make('KuhnPoker-v0', **dict())))
+    return ObservationWrapper(gym.make('KuhnPoker-v0', **dict()))
         
 def test_ppo(args=get_args()):
     # env = gym.make('KuhnPoker-v0', **dict())
@@ -137,16 +127,6 @@ def test_ppo(args=get_args()):
     )
     # test_collector = Collector(policy, test_envs)
     # log
-    log_path = os.path.join(args.logdir, args.task, 'ppo')
-    writer = SummaryWriter(log_path)
-    logger = TensorboardLogger(writer)
-
-    def save_best_fn(policy):
-        torch.save(policy.state_dict(), os.path.join(log_path, 'policy.pth'))
-
-    def stop_fn(mean_rewards):
-        return mean_rewards >= args.reward_threshold
-
     # trainer
     result = onpolicy_trainer(
         policy,
@@ -157,12 +137,8 @@ def test_ppo(args=get_args()):
         args.repeat_per_collect,
         args.test_num,
         args.batch_size,
-        step_per_collect=args.step_per_collect,
-        stop_fn=stop_fn,
-        save_best_fn=save_best_fn,
-        logger=logger
+        episode_per_collect=700,
     )
-    assert stop_fn(result['best_reward'])
 
     if __name__ == '__main__':
         pprint.pprint(result)
