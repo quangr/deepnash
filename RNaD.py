@@ -12,7 +12,7 @@ from tianshou.utils.net.common import ActorCritic
 from tianshou.utils import RunningMeanStd
 
 
-class PPOPolicy(BasePolicy):
+class RNaDPolicy(BasePolicy):
     r"""Implementation of Proximal Policy Optimization. arXiv:1707.06347.
 
     :param torch.nn.Module actor: the actor network following the rules in
@@ -121,23 +121,24 @@ class PPOPolicy(BasePolicy):
         self._norm_adv = advantage_normalization
         self._recompute_adv = recompute_advantage
         self._actor_critic: ActorCritic
-        self._delta_m=3
-        self._eta=0.2
+        self._delta_m = 3
+        self._eta = 0.2
 
     def process_fn(
         self, batch: Batch, buffer: ReplayBuffer, indices: np.ndarray
     ) -> Batch:
-        if self._recompute_adv:
-            # buffer input `buffer` and `indices` to be used in `learn()`.
-            self._buffer, self._indices = buffer, indices
+        self._buffer, self._indices = buffer, indices
         batch = self._compute_returns(batch, buffer, indices)
         batch.act = to_torch_as(batch.act, batch.v_s)
-        old_log_prob,reg_log_prob,old_reg_log_prob = [],[],[]
+        old_log_prob, reg_log_prob, old_reg_log_prob = [], [], []
         with torch.no_grad():
             for minibatch in batch.split(self._batch, shuffle=False, merge_last=True):
-                old_log_prob.append(self(minibatch).dist.log_prob(minibatch.act))
-                reg_log_prob.append(self.reg(minibatch).dist.log_prob(minibatch.act))
-                old_reg_log_prob.append(self.reg(minibatch,old=True).dist.log_prob(minibatch.act))
+                old_log_prob.append(
+                    self(minibatch).dist.log_prob(minibatch.act))
+                reg_log_prob.append(
+                    self.reg(minibatch).dist.log_prob(minibatch.act))
+                old_reg_log_prob.append(
+                    self.reg(minibatch, old=True).dist.log_prob(minibatch.act))
         batch.logp_old = torch.cat(old_log_prob, dim=0)
         batch.reg_logp = torch.cat(reg_log_prob, dim=0)
         batch.reg_logp_old = torch.cat(old_reg_log_prob, dim=0)
@@ -150,18 +151,32 @@ class PPOPolicy(BasePolicy):
     ) -> Dict[str, List[float]]:
         losses, clip_losses, vf_losses, ent_losses = [], [], [], []
         for step in range(repeat):
-            # if self._recompute_adv and step > 0:
-            #     batch = self._compute_returns(batch, self._buffer, self._indices)
+            print(self(Batch(obs=[[0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0],
+                                  [0, 1, 0, 1, 0, 0, 0, 1, 1,
+                                      0, 0, 1, 0, 0, 1, 0, 0],
+                                  [0, 1, 0, 0, 1, 0, 0, 1, 1,
+                                      0, 0, 1, 0, 0, 1, 0, 0],
+                                  [0, 1, 1, 0, 0, 0, 1, 0, 1,
+                                      0, 0, 1, 0, 0, 1, 0, 0],
+                                  [0, 1, 0, 1, 0, 0, 1, 0, 1,
+                                      0, 0, 1, 0, 0, 1, 0, 0],
+                                  [0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0]])).logits.softmax(dim=1))
+            if step > 0:
+                #     batch = self._compute_returns(batch, self._buffer, self._indices)
+                batch = self._compute_returns(
+                    batch, self._buffer, self._indices)
+                batch = self._compute_values(
+                    batch, self._buffer, self._indices)
             for minibatch in batch.split(batch_size, merge_last=True):
                 # calculate loss for actor
-                Q_s=minibatch.Q_s.clamp(-10000,10000)
-                logits=self(minibatch).logits.gather(-1, minibatch.act.long().unsqueeze(-1))
+                Q_s = minibatch.Q_s.clamp(-10000, 10000)
+                logits = self(minibatch).logits#.gather(-1,minibatch.act.long().unsqueeze(-1))
                 surr = logits * Q_s
-                clip_loss=surr.clamp(-2, 2).mean()
+                clip_loss = -surr.clamp(-2, 2).mean()
                 # calculate loss for critic
                 value = self.critic(minibatch.obs).flatten()
                 vf_loss = (minibatch.V_s - value).pow(2).mean()
-                loss = clip_loss + self._weight_vf * vf_loss 
+                loss = clip_loss + self._weight_vf * vf_loss
                 self.optim.zero_grad()
                 loss.backward()
                 if self._grad_norm:  # clip large gradient
@@ -172,13 +187,16 @@ class PPOPolicy(BasePolicy):
                 clip_losses.append(clip_loss.item())
                 vf_losses.append(vf_loss.item())
                 losses.append(loss.item())
-
+        self.reg_actor_old = self.reg_actor
+        # suppose to be average weight
+        self.reg_actor = copy.deepcopy(self.actor)
         return {
             "loss": losses,
             "loss/clip": clip_losses,
             "loss/vf": vf_losses,
             "loss/ent": ent_losses,
         }
+
     def _compute_returns(
         self, batch: Batch, buffer: ReplayBuffer, indices: np.ndarray
     ) -> Batch:
@@ -214,50 +232,54 @@ class PPOPolicy(BasePolicy):
         # batch.adv = to_torch_as(advantages, batch.v_s)
         return batch
 
-
     def _transform_returns(
         self, batch: Batch, buffer: ReplayBuffer, indices: np.ndarray
     ) -> Batch:
-        reg_reward=(batch.logp_old-batch.reg_logp).cpu().numpy()
+        reg_reward = (batch.logp_old-batch.reg_logp).cpu().numpy()
+        rew_ = np.zeros(batch.rew.shape)
         for i in range(2):
-            batch.rew[:,i] = batch.rew[:,i]+(1-2*(batch.info.current_player==i).astype(int))*self._eta*reg_reward
+            rew_[:, i] = batch.rew[:, i] + \
+                (1-2*(batch.info.current_player == i).astype(int)) * \
+                self._eta*reg_reward
+        batch.rew_ = rew_
         return batch
 
     def _compute_values(
         self, batch: Batch, buffer: ReplayBuffer, indices: np.ndarray
     ) -> Batch:
         v_s = batch.v_s.cpu().numpy()
-        rew=batch.rew
-        current_player=batch.info.current_player
-        logp=self(batch).dist.log_prob(batch.act)
-        reg_p=torch.exp(batch.reg_logp)
-        reg_p_old=torch.exp(batch.reg_logp_old)
-        p_ratio=torch.exp(logp-batch.logp_old)
-        reg_p_ratio=torch.exp(logp-batch.reg_logp)
-        V_s=np.zeros(batch.v_s.shape)
-        Q_s=np.zeros(batch.v_s.shape+(2,))
+        rew = batch.rew_
+        current_player = batch.info.current_player
+        logp = self(batch).dist.log_prob(batch.act)
+        reg_p = torch.exp(batch.reg_logp)
+        reg_p_old = torch.exp(batch.reg_logp_old)
+        p_ratio = torch.exp(logp-batch.logp_old)
+        reg_p_ratio = torch.exp(logp-batch.reg_logp)
+        V_s = np.zeros(batch.v_s.shape)
+        Q_s = np.zeros(batch.v_s.shape+(2,))
         for player in range(2):
             for i in range(len(rew) - 1, -1, -1):
                 if batch.done[i]:
-                    v=0
-                    V=0
-                    r=0
-                    ksi=1
-                if current_player[i]!=player:
-                    r=rew[i][player]+p_ratio[i]*r
-                    ksi=ksi*p_ratio[i]
+                    v = 0
+                    V = 0
+                    r = 0
+                    ksi = 1
+                if current_player[i] != player:
+                    r = rew[i][player]+p_ratio[i]*r
+                    ksi = ksi*p_ratio[i]
                 else:
-                    rho=min(1,p_ratio[i]*ksi)
-                    c=min(1,p_ratio[i]*ksi)
-                    delta_V=rho*(rew[i][player]+r*p_ratio[i]+V-v_s[i])
+                    rho = min(1, p_ratio[i]*ksi)
+                    c = min(1, p_ratio[i]*ksi)
+                    delta_V = rho*(rew[i][player]+r*p_ratio[i]+V-v_s[i])
                     for act in range(2):
-                        ratio=reg_p
-                        Q_s[i][act]=v_s[i]-self._eta*reg_p_ratio[i]+int(act==batch.act[i])/torch.exp(batch.logp_old[i])*(rew[i][player]+self._eta*reg_p_ratio[i]+p_ratio[i]*(r+v)-v_s[i])
-                    v=v_s[i]+delta_V+c*(v-V)
-                    V=v_s[i]
-                    r=0
-                    ksi=1
-                    V_s[i]=v
+                        ratio = reg_p
+                        Q_s[i][act] = v_s[i]-self._eta*reg_p_ratio[i]+int(act == batch.act[i])/torch.exp(
+                            batch.logp_old[i])*(rew[i][player]+self._eta*reg_p_ratio[i]+p_ratio[i]*(r+v)-v_s[i])
+                    v = v_s[i]+delta_V+c*(v-V)
+                    V = v_s[i]
+                    r = 0
+                    ksi = 1
+                    V_s[i] = v
         batch.V_s = to_torch_as(V_s, batch.v_s)
         batch.Q_s = to_torch_as(Q_s, batch.v_s)
         return batch
@@ -299,9 +321,6 @@ class PPOPolicy(BasePolicy):
         else:
             act = dist.sample()
         return Batch(logits=logits, act=act, state=hidden, dist=dist)
-
-
-
 
     def forward(
         self,

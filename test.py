@@ -12,7 +12,7 @@ from tianshou.utils import TensorboardLogger
 from tianshou.utils.net.common import ActorCritic, DataParallelNet, Net
 from tianshou.utils.net.discrete import Actor, Critic
 
-from ppo import PPOPolicy
+from RNaD import RNaDPolicy
 
 import gym_kuhn_poker
 
@@ -24,7 +24,7 @@ def get_args():
     parser.add_argument('--reward-threshold', type=float, default=None)
     parser.add_argument('--seed', type=int, default=1626)
     parser.add_argument('--buffer-size', type=int, default=20000)
-    parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--epoch', type=int, default=10)
     parser.add_argument('--step-per-epoch', type=int, default=50000)
@@ -40,7 +40,7 @@ def get_args():
         '--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu'
     )
     # ppo special
-    parser.add_argument('--vf-coef', type=float, default=0.5)
+    parser.add_argument('--vf-coef', type=float, default=1)
     parser.add_argument('--ent-coef', type=float, default=0.0)
     parser.add_argument('--eps-clip', type=float, default=0.2)
     parser.add_argument('--max-grad-norm', type=float, default=0.5)
@@ -100,9 +100,9 @@ def test_ppo(args=get_args()):
         if isinstance(m, torch.nn.Linear):
             torch.nn.init.orthogonal_(m.weight)
             torch.nn.init.zeros_(m.bias)
-    optim = torch.optim.Adam(actor_critic.parameters(), lr=args.lr)
-    dist = torch.distributions.Categorical
-    policy = PPOPolicy(
+    optim = torch.optim.Adam(actor_critic.parameters(), lr=args.lr,betas=(0.0,0.999))
+    dist = lambda logits:torch.distributions.Categorical(logits=logits)
+    policy = RNaDPolicy(
         actor,
         critic,
         optim,
@@ -137,7 +137,7 @@ def test_ppo(args=get_args()):
         args.repeat_per_collect,
         args.test_num,
         args.batch_size,
-        episode_per_collect=700,
+        episode_per_collect=1100,
     )
 
     if __name__ == '__main__':
